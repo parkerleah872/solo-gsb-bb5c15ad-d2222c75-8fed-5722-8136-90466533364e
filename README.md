@@ -6,6 +6,9 @@
 接收每个节点的成功/失败回报；节点失败时若**自动重试额度未用尽**则原子递增尝试次数、将节点恢复为 `pending`
 并按可配置延迟安排重试（到期前节点不会出现在 `next_nodes`，提前回报返回 `409 retry_not_due`）；
 **达到尝试上限**后仅回滚本批次已成功的节点并返回**可重试的断点**；同时拒绝**循环依赖**和**跨版本 / 乱序回报**。
+支持**安全取消发布批次**（`POST /api/releases/{id}/cancel`）：基于修订号 `revision` 的乐观并发校验，
+仅 `pending` / `running` 批次可取消；取消成功后未执行节点标记为 `cancelled`、已成功节点按逆拓扑顺序回滚，
+已取消批次彻底冻结（拒绝回报与重试）。
 还提供只读的**批次结构差异与影响面分析**（`GET /api/releases/{id}/diff?base_release_id=...`）：
 仅比较两个批次**实际持久化的裁剪后图**，输出 added / removed / changed（字段级 reasons），
 并从新增 / 变更节点沿目标批次依赖边向下游传播得到 `impacted_nodes`。
@@ -153,6 +156,34 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 节点详情返回 `attempt_count`、`max_attempts`、`retry_delay_seconds`、`retry_scheduled`、
   `next_retry_at`（UTC ISO-8601）。
 
+**安全取消发布批次（修订号乐观并发）**
+
+`POST /api/releases/{id}/cancel` 接收 `reason`（取消原因，1～500 字符）与
+`expected_revision`（期望修订号，非负整数）：
+
+- 每个批次携带 `revision` 修订号：创建时为 `0`，**每次状态迁移（回报成功 / 失败、
+  调度自动重试、断点重试、取消）+1**；状态查询（详情与列表）均返回当前 `revision`，
+  取消前先 `GET /api/releases/{id}` 获取；
+- 仅 `pending` / `running` 批次可取消；`succeeded` / `failed` / `partially_rolled_back` /
+  已取消批次一律返回 `409 cancel_not_allowed`（携带当前 `status`）；
+- 取消操作在**同一 SQLite 事务内**校验 `expected_revision`：与当前修订号不一致时返回
+  `409 state_conflict`（携带 `current_revision` 与 `expected_revision`），
+  **批次与节点状态保持完全不变**，可重新查询后按新修订号重试；
+- **取消与节点回报并发时只有一个状态迁移成功**：所有写操作由事务串行化，
+  取消先提交则回报看到已取消批次被拒（`409 release_cancelled`）；
+  回报先提交则修订号已递增，取消看到过期修订号被拒（`409 state_conflict`，
+  若回报使批次进入终态则为 `409 cancel_not_allowed`）；
+- 取消成功后：所有未执行节点（含自动重试等待中的节点，同时清除其 `retry_scheduled` /
+  `next_retry_at`）标记为 `cancelled`；已成功节点按**逆拓扑顺序**回滚为 `rolled_back`
+  （与失败回滚同一规则：层级高的优先，同层按成功时间倒序）；批次进入 `cancelled`，
+  记录 `cancel_reason` 与 `cancelled_at`（UTC ISO-8601），修订号 +1；
+  响应返回 `cancelled_nodes`、`rolled_back_nodes` 与新 `revision`；
+- 已取消批次彻底冻结：`report` 与 `retry` 一律返回 `409 release_cancelled`
+  （携带 `cancel_reason` / `cancelled_at`），再次取消返回 `409 cancel_not_allowed`；
+  状态查询（详情与列表）展示 `cancel_reason` 与 `cancelled_at`；
+- 旧数据库与旧批次通过启动时幂等迁移兼容（`revision` 从 `0` 开始、
+  `cancel_reason` / `cancelled_at` 为 `NULL`），行为与升级前一致。
+
 **失败回滚与断点重试**
 
 - 任一节点回报 `failed`：批次标记为 `partially_rolled_back`（此前无成功节点时为 `failed`）。
@@ -165,20 +196,21 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 节点状态：`pending` → `success` / `failed`；失败未达重试上限时节点保持 `pending`
 （`retry_scheduled=true`、等待 `next_retry_at` 到期）；成功节点失败回滚后变为 `rolled_back`，
-终态重试重置回 `pending`。
-批次状态：`pending` / `running` / `succeeded` / `failed` / `partially_rolled_back`。
+终态重试重置回 `pending`；批次取消时未执行节点变为 `cancelled`。
+批次状态：`pending` / `running` / `succeeded` / `failed` / `partially_rolled_back` / `cancelled`。
 
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/releases` | 创建发布批次（提交节点 + 依赖；可选非空不重复 `targets` 按目标裁剪为诱导子图；节点可填正整数 `estimated_seconds`、`max_attempts`(1~10)、`retry_delay_seconds`(0~3600)，自动拓扑分层，拒绝环） |
-| `GET` | `/api/releases?limit=50` | 发布批次列表 |
-| `GET` | `/api/releases/{id}` | 查询发布状态（节点状态含 `attempt_count` / `max_attempts` / `next_retry_at`、进度、next_nodes，未到期重试节点不出现） |
+| `GET` | `/api/releases?limit=50` | 发布批次列表（含 `revision` / `cancel_reason` / `cancelled_at`） |
+| `GET` | `/api/releases/{id}` | 查询发布状态（节点状态含 `attempt_count` / `max_attempts` / `next_retry_at`、进度、next_nodes，未到期重试节点不出现；批次级含 `revision` 与取消原因 / 时间） |
 | `GET` | `/api/releases/{id}/plan?deadline_seconds=` | 拓扑分层 + CPM 工期分析（最短工期、最早/最晚开始、total_slack、零余量关键节点、字典序最小关键路径；可选截止工期可行性，只读） |
 | `GET` | `/api/releases/{id}/diff?base_release_id=` | 两批次结构差异与影响面（仅比较实际持久化的裁剪后图；added/removed/changed 字段级 reasons；impacted_nodes 沿目标批次边向下游传递含起点；稳定排序 + 计数；只读，缺失批次 404） |
 | `POST` | `/api/releases/{id}/report` | 节点成功 / 失败回报（跨版本、乱序返回 409；自动重试等待期返回 409 retry_not_due；未达上限返回 retry_scheduled，达上限失败回滚） |
 | `POST` | `/api/releases/{id}/retry` | 从断点续发 |
+| `POST` | `/api/releases/{id}/cancel` | 安全取消批次（`reason` + `expected_revision` 乐观并发；仅 pending/running 可取消；未执行节点 cancelled、已成功节点逆拓扑回滚；过期修订号 409 state_conflict 且状态不变；已取消批次 report/retry 返回 409 release_cancelled） |
 | `GET` | `/health` | 健康检查 |
 
 错误响应统一格式：`{"error": {"code": "...", "message": "...", ...}}`。
@@ -323,6 +355,47 @@ curl -s -X POST http://localhost:8000/api/releases/<ID>/retry
 curl -s http://localhost:8000/api/releases/<ID>
 ```
 
+安全取消示例（修订号乐观并发）：
+
+```bash
+# 1) 创建批次并回报部分节点（每次状态迁移 revision +1）
+curl -s -X POST http://localhost:8000/api/releases \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "2026.09.21-005",
+    "nodes": [{"name": "svc-a"}, {"name": "svc-b"}, {"name": "svc-c"}],
+    "dependencies": [{"from_node": "svc-a", "to_node": "svc-c"},
+                     {"from_node": "svc-b", "to_node": "svc-c"}]
+  }'
+curl -s -X POST http://localhost:8000/api/releases/<ID>/report \
+  -H 'Content-Type: application/json' \
+  -d '{"node":"svc-a","status":"success","version":"2026.09.21-005"}'
+
+# 2) 查询当前修订号（状态查询返回 revision / cancel_reason / cancelled_at）
+curl -s http://localhost:8000/api/releases/<ID>
+# -> {"status":"running","revision":1,"cancel_reason":null,"cancelled_at":null, ...}
+
+# 3) 携带 expected_revision 取消：未执行的 svc-b/svc-c 标记 cancelled，
+#    已成功的 svc-a 逆拓扑回滚为 rolled_back
+curl -s -X POST http://localhost:8000/api/releases/<ID>/cancel \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"线上告警，紧急取消","expected_revision":1}'
+# -> {"result":"cancelled","reason":"线上告警，紧急取消",
+#     "cancelled_at":"2026-09-21T...","revision":2,
+#     "cancelled_nodes":[{"node":"svc-b","level":0},{"node":"svc-c","level":1}],
+#     "rolled_back_nodes":[{"node":"svc-a","level":0}],
+#     "release":{"status":"cancelled","cancel_reason":"线上告警，紧急取消", ...}}
+
+# 4) 修订号过期（期间有其他状态迁移）-> 409，状态不变
+#    {"error":{"code":"state_conflict","current_revision":2,"expected_revision":1, ...}}
+
+# 5) 已取消批次彻底冻结
+#    POST /report -> 409 release_cancelled（携带 cancel_reason / cancelled_at）
+#    POST /retry  -> 409 release_cancelled
+#    再次 cancel  -> 409 cancel_not_allowed
+#    终态批次（succeeded/failed/partially_rolled_back）cancel -> 409 cancel_not_allowed
+```
+
 有限自动重试示例（最多 3 次尝试、每次间隔 60 秒）：
 
 ```bash
@@ -369,7 +442,7 @@ curl -i -X POST http://localhost:8000/api/releases \
 │   ├── database.py    # SQLite 连接、建表、事务
 │   ├── models.py      # 请求模型
 │   ├── errors.py      # 业务异常
-│   └── service.py     # 拓扑分层 / 批次 / 回报 / 回滚 / 重试 / 批次差异与影响面
+│   └── service.py     # 拓扑分层 / 批次 / 回报 / 回滚 / 重试 / 安全取消 / 批次差异与影响面
 ├── requirements.txt
 ├── smoke_test.py      # 端到端冒烟测试（pip install httpx 后 python3 smoke_test.py）
 ├── Dockerfile         # 构建期安装依赖
@@ -397,4 +470,9 @@ targets 空/重复/空白/类型校验、unknown_target 422 且整批零写入�
 targets=null 全量发布、旧库补列（targets_json/excluded_node_count/is_target）且旧批次按全量兼容、
 发布批次结构差异与影响面（added/removed/changed 五类字段级 reasons、仅比较持久化裁剪后图、
 impacted_nodes 沿目标批次依赖边向下游传递含起点、removed 不参与传播、各列表稳定排序与计数、
-相同批次 / 自身比较为空、只读不改状态、缺失批次 404、缺少 base_release_id 422）。
+相同批次 / 自身比较为空、只读不改状态、缺失批次 404、缺少 base_release_id 422）、
+安全取消（pending 批次全节点 cancelled、running 批次未执行节点 cancelled + 已成功节点逆拓扑回滚、
+revision 随每次状态迁移 +1、过期修订号 409 state_conflict 且状态不变、终态批次 409 cancel_not_allowed、
+已取消批次 report/retry 409 release_cancelled 且再次取消被拒、重试等待中节点取消并清除重试标记、
+取消与回报并发只有一个状态迁移成功、状态/列表展示 cancel_reason 与 cancelled_at、
+旧库补列 revision/cancel_reason/cancelled_at 且旧批次兼容）。

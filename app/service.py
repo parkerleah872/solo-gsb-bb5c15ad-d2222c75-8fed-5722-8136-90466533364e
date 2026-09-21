@@ -1,4 +1,4 @@
-"""核心业务逻辑：发布批次、拓扑分层、节点回报、失败回滚、重试断点。"""
+"""核心业务逻辑：发布批次、拓扑分层、节点回报、失败回滚、重试断点、安全取消。"""
 from __future__ import annotations
 
 import json
@@ -9,13 +9,16 @@ from typing import Any
 
 from .database import get_conn, lock, transaction
 from .errors import APIError
-from .models import CreateReleaseRequest, ReportRequest
+from .models import CancelRequest, CreateReleaseRequest, ReportRequest
 
 # 节点状态
-PENDING, SUCCESS, FAILED, ROLLED_BACK = "pending", "success", "failed", "rolled_back"
+PENDING, SUCCESS, FAILED, ROLLED_BACK, CANCELLED = (
+    "pending", "success", "failed", "rolled_back", "cancelled",
+)
 # 发布状态
 R_PENDING, R_RUNNING = "pending", "running"
 R_SUCCEEDED, R_FAILED, R_ROLLED_BACK = "succeeded", "failed", "partially_rolled_back"
+R_CANCELLED = "cancelled"
 
 
 def _now() -> str:
@@ -326,10 +329,13 @@ def _release_summary(r: dict[str, Any]) -> dict[str, Any]:
         "id": r["id"],
         "version": r["version"],
         "status": r["status"],
+        "revision": int(r.get("revision") or 0),
         "levels": json.loads(r["levels_json"]),
         "targets": json.loads(r["targets_json"]) if r.get("targets_json") else None,
         "excluded_node_count": int(r.get("excluded_node_count") or 0),
         "failed_node": r["failed_node"],
+        "cancel_reason": r.get("cancel_reason"),
+        "cancelled_at": r.get("cancelled_at"),
         "created_at": r["created_at"],
         "updated_at": r["updated_at"],
     }
@@ -442,6 +448,7 @@ def _build_view(conn, r) -> dict[str, Any]:
         "id": r["id"],
         "version": r["version"],
         "status": r["status"],
+        "revision": int(r.get("revision") or 0),
         "levels": json.loads(r["levels_json"]),
         "targets": json.loads(r["targets_json"]) if r.get("targets_json") else None,
         "excluded_node_count": int(r.get("excluded_node_count") or 0),
@@ -449,6 +456,8 @@ def _build_view(conn, r) -> dict[str, Any]:
         "error_code": r["error_code"],
         "error_message": r["error_message"],
         "failed_at": r["failed_at"],
+        "cancel_reason": r.get("cancel_reason"),
+        "cancelled_at": r.get("cancelled_at"),
         "created_at": r["created_at"],
         "updated_at": r["updated_at"],
         "progress": {"succeeded": done, "total": total, "completed": done == total and total > 0},
@@ -615,6 +624,15 @@ def report_node(release_id: str, payload: ReportRequest) -> dict[str, Any]:
     with transaction() as conn:
         r = dict(_get_release_row(conn, release_id))
 
+        # 0) 已取消批次彻底冻结：拒绝一切回报（取消与回报并发时，取消先提交则回报必失败）
+        if r["status"] == R_CANCELLED:
+            raise APIError(
+                409, "release_cancelled",
+                "该批次已取消，不再接受节点回报",
+                {"cancel_reason": r.get("cancel_reason"),
+                 "cancelled_at": r.get("cancelled_at")},
+            )
+
         # 1) 拒绝跨版本回报
         if payload.version != r["version"]:
             raise APIError(
@@ -708,11 +726,14 @@ def report_node(release_id: str, payload: ReportRequest) -> dict[str, Any]:
                 (release_id, SUCCESS),
             ).fetchone()["c"]
             new_status = R_SUCCEEDED if pending == 0 else R_RUNNING
+            # 每次状态迁移修订号 +1：取消操作据此做乐观并发校验
+            new_revision = int(r["revision"] or 0) + 1
             conn.execute(
-                "UPDATE releases SET status = ?, updated_at = ? WHERE id = ?",
-                (new_status, now, release_id),
+                "UPDATE releases SET status = ?, revision = ?, updated_at = ? WHERE id = ?",
+                (new_status, new_revision, now, release_id),
             )
             r["status"] = new_status
+            r["revision"] = new_revision
             r["updated_at"] = now
             view = _build_view(conn, r)
             return {"result": "accepted", "release": view}
@@ -754,11 +775,13 @@ def report_node(release_id: str, payload: ReportRequest) -> dict[str, Any]:
                  "retry_delay_seconds": retry_delay, "next_retry_at": next_retry_at},
             )
             # 自动重试不改变批次终态：pending -> running，running 保持 running
+            new_revision = int(r["revision"] or 0) + 1
             conn.execute(
-                "UPDATE releases SET status = ?, updated_at = ? WHERE id = ?",
-                (R_RUNNING, now, release_id),
+                "UPDATE releases SET status = ?, revision = ?, updated_at = ? WHERE id = ?",
+                (R_RUNNING, new_revision, now, release_id),
             )
             r["status"] = R_RUNNING
+            r["revision"] = new_revision
             r["updated_at"] = now
             view = _build_view(conn, r)
             return {
@@ -807,15 +830,16 @@ def report_node(release_id: str, payload: ReportRequest) -> dict[str, Any]:
             rolled_back.append({"node": row["name"], "level": row["level"]})
 
         new_status = R_ROLLED_BACK if rolled_back else R_FAILED
+        new_revision = int(r["revision"] or 0) + 1
         conn.execute(
             """UPDATE releases SET status = ?, error_code = ?, error_message = ?,
-               failed_node = ?, failed_at = ?, updated_at = ? WHERE id = ?""",
+               failed_node = ?, failed_at = ?, revision = ?, updated_at = ? WHERE id = ?""",
             (new_status, payload.error_code or "NODE_FAILED", payload.error_message,
-             payload.node, now, now, release_id),
+             payload.node, now, new_revision, now, release_id),
         )
         r.update(status=new_status, error_code=payload.error_code or "NODE_FAILED",
                  error_message=payload.error_message, failed_node=payload.node,
-                 failed_at=now, updated_at=now)
+                 failed_at=now, revision=new_revision, updated_at=now)
 
         view = _build_view(conn, r)
 
@@ -855,6 +879,13 @@ def report_node(release_id: str, payload: ReportRequest) -> dict[str, Any]:
 def retry_release(release_id: str) -> dict[str, Any]:
     with transaction() as conn:
         r = dict(_get_release_row(conn, release_id))
+        if r["status"] == R_CANCELLED:
+            raise APIError(
+                409, "release_cancelled",
+                "该批次已取消，不可重试；如需发布请创建新批次",
+                {"cancel_reason": r.get("cancel_reason"),
+                 "cancelled_at": r.get("cancelled_at")},
+            )
         if r["status"] not in (R_FAILED, R_ROLLED_BACK):
             raise APIError(
                 409, "retry_not_allowed",
@@ -876,13 +907,14 @@ def retry_release(release_id: str) -> dict[str, Any]:
         for row in reset_rows:
             _record_event(conn, release_id, row["name"], "retry_reset", r["version"], {})
 
+        new_revision = int(r["revision"] or 0) + 1
         conn.execute(
             """UPDATE releases SET status = ?, error_code = NULL, error_message = NULL,
-               failed_node = NULL, failed_at = NULL, updated_at = ? WHERE id = ?""",
-            (R_RUNNING, now, release_id),
+               failed_node = NULL, failed_at = NULL, revision = ?, updated_at = ? WHERE id = ?""",
+            (R_RUNNING, new_revision, now, release_id),
         )
         r.update(status=R_RUNNING, error_code=None, error_message=None,
-                 failed_node=None, failed_at=None, updated_at=now)
+                 failed_node=None, failed_at=None, revision=new_revision, updated_at=now)
         view = _build_view(conn, r)
 
         return {
@@ -892,5 +924,99 @@ def retry_release(release_id: str) -> dict[str, Any]:
                 "next_nodes": view["next_nodes"],
                 "instruction": "从 next_nodes 中的节点开始重新按拓扑层级回报",
             },
+            "release": view,
+        }
+
+
+# --------------------------------------------------------------------------- #
+# 安全取消（乐观并发：expected_revision 比较-交换）
+# --------------------------------------------------------------------------- #
+def cancel_release(release_id: str, payload: CancelRequest) -> dict[str, Any]:
+    """取消 pending / running 批次。
+
+    全程处于同一 SQLite 事务（写锁串行化所有写操作）：先校验批次可取消，再比较
+    修订号。与节点回报并发时两者必有一个先提交——取消先提交则回报看到已取消批次
+    被拒（409 release_cancelled）；回报先提交则修订号已递增，取消看到过期修订号
+    被拒（409 state_conflict），保证只有一个状态迁移成功。
+    """
+    with transaction() as conn:
+        r = dict(_get_release_row(conn, release_id))
+
+        # 1) 仅 pending / running 可取消；终态（含已取消）一律拒绝
+        if r["status"] not in (R_PENDING, R_RUNNING):
+            raise APIError(
+                409, "cancel_not_allowed",
+                f"批次状态为 {r['status']}，仅 pending / running 状态可取消",
+                {"status": r["status"]},
+            )
+
+        # 2) 同一事务内校验修订号：过期即 409 state_conflict，批次与节点状态保持不变
+        current_revision = int(r["revision"] or 0)
+        if payload.expected_revision != current_revision:
+            raise APIError(
+                409, "state_conflict",
+                f"修订号已过期：期望 {payload.expected_revision}，当前 {current_revision}；"
+                "批次状态已被其他操作改变，请重新查询后再试",
+                {"expected_revision": payload.expected_revision,
+                 "current_revision": current_revision},
+            )
+
+        now = _now()
+        new_revision = current_revision + 1
+
+        # 3) 未执行节点 -> cancelled（含自动重试等待中的 pending 节点，清除重试标记）
+        pending_rows = conn.execute(
+            """SELECT name, level FROM nodes
+               WHERE release_id = ? AND status = ? ORDER BY level, name""",
+            (release_id, PENDING),
+        ).fetchall()
+        cancelled_nodes: list[dict[str, Any]] = []
+        for row in pending_rows:
+            conn.execute(
+                """UPDATE nodes SET status = ?, updated_at = ?,
+                   retry_scheduled = 0, next_retry_at = NULL
+                   WHERE release_id = ? AND name = ?""",
+                (CANCELLED, now, release_id, row["name"]),
+            )
+            _record_event(conn, release_id, row["name"], "cancel", r["version"],
+                          {"level": row["level"], "reason": payload.reason})
+            cancelled_nodes.append({"node": row["name"], "level": row["level"]})
+
+        # 4) 已成功节点按逆拓扑顺序回滚（与失败回滚同一规则：层级高的优先，同层按成功时间倒序）
+        success_rows = conn.execute(
+            """SELECT name, level FROM nodes
+               WHERE release_id = ? AND status = ?
+               ORDER BY level DESC, reported_at DESC, name DESC""",
+            (release_id, SUCCESS),
+        ).fetchall()
+        rolled_back: list[dict[str, Any]] = []
+        for row in success_rows:
+            conn.execute(
+                """UPDATE nodes SET status = ?, updated_at = ?,
+                   retry_scheduled = 0, next_retry_at = NULL
+                   WHERE release_id = ? AND name = ?""",
+                (ROLLED_BACK, now, release_id, row["name"]),
+            )
+            _record_event(conn, release_id, row["name"], "rollback", r["version"],
+                          {"level": row["level"], "triggered_by": "cancel"})
+            rolled_back.append({"node": row["name"], "level": row["level"]})
+
+        # 5) 批次进入 cancelled：记录取消原因与时间，修订号 +1
+        conn.execute(
+            """UPDATE releases SET status = ?, cancel_reason = ?, cancelled_at = ?,
+               revision = ?, updated_at = ? WHERE id = ?""",
+            (R_CANCELLED, payload.reason, now, new_revision, now, release_id),
+        )
+        r.update(status=R_CANCELLED, cancel_reason=payload.reason, cancelled_at=now,
+                 revision=new_revision, updated_at=now)
+        view = _build_view(conn, r)
+
+        return {
+            "result": "cancelled",
+            "reason": payload.reason,
+            "cancelled_at": now,
+            "cancelled_nodes": cancelled_nodes,
+            "rolled_back_nodes": rolled_back,
+            "revision": new_revision,
             "release": view,
         }

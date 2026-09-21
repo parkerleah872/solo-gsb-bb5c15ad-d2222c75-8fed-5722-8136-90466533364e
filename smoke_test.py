@@ -537,6 +537,7 @@ assert "estimated_seconds" in cols, cols
 assert "is_target" in cols, cols  # 旧库幂等补列
 rel_cols = {row["name"] for row in database.get_conn().execute("PRAGMA table_info(releases)")}
 assert {"targets_json", "excluded_node_count"} <= rel_cols, rel_cols
+assert {"revision", "cancel_reason", "cancelled_at"} <= rel_cols, rel_cols  # 安全取消补列
 with TestClient(app) as legacy_client:
     lg0 = legacy_client.get("/api/releases/leg1").json()
     # 旧批次：无 targets 概念，按全量发布兼容
@@ -839,5 +840,233 @@ assert client.get(f"/api/releases/{dtid}/diff").status_code == 422
 assert client.get(f"/api/releases/{dtid}/diff",
                   params={"base_release_id": " "}).status_code == 404  # 非空但不存在 -> 404
 print("[OK] diff 只读不改状态；缺失批次 404、缺少 base_release_id 422、空白值按不存在 404")
+
+# --- 23. 安全取消：修订号乐观并发、节点取消与逆拓扑回滚、取消后冻结 ---
+# 23a. pending 批次：修订号过期 -> 409 state_conflict 且状态不变；正确修订号 -> 全部 cancelled
+r = client.post("/api/releases", json={
+    "version": "v-cancel",
+    "nodes": [{"name": "a"}, {"name": "b"}, {"name": "c"}],
+    "dependencies": [{"from_node": "a", "to_node": "c"},
+                     {"from_node": "b", "to_node": "c"}],
+})
+assert r.status_code == 201, r.text
+cancel_id = r.json()["id"]
+assert r.json()["revision"] == 0  # 新批次修订号从 0 开始
+assert r.json()["cancel_reason"] is None and r.json()["cancelled_at"] is None
+
+r = client.post(f"/api/releases/{cancel_id}/cancel",
+                json={"reason": "过期修订号", "expected_revision": 5})
+assert r.status_code == 409 and r.json()["error"]["code"] == "state_conflict"
+assert r.json()["error"]["current_revision"] == 0
+assert r.json()["error"]["expected_revision"] == 5
+# 状态不变：批次仍 pending、节点仍 pending、修订号仍 0
+st = client.get(f"/api/releases/{cancel_id}").json()
+assert st["status"] == "pending" and st["revision"] == 0
+assert all(n["status"] == "pending" for n in st["nodes"])
+print("[OK] 取消修订号过期 -> 409 state_conflict，批次与节点状态不变")
+
+r = client.post(f"/api/releases/{cancel_id}/cancel",
+                json={"reason": "需求变更，停止发布", "expected_revision": 0})
+assert r.status_code == 200, r.text
+cb = r.json()
+assert cb["result"] == "cancelled"
+assert cb["reason"] == "需求变更，停止发布" and cb["cancelled_at"]
+assert cb["revision"] == 1  # 返回新修订号
+assert [n["node"] for n in cb["cancelled_nodes"]] == ["a", "b", "c"]  # 按层级+节点名排序
+assert cb["rolled_back_nodes"] == []  # 无成功节点可回滚
+rel = cb["release"]
+assert rel["status"] == "cancelled" and rel["revision"] == 1
+assert rel["cancel_reason"] == "需求变更，停止发布"
+assert rel["cancelled_at"] == cb["cancelled_at"]
+assert rel["next_nodes"] == []
+assert {n["name"]: n["status"] for n in rel["nodes"]} == {
+    "a": "cancelled", "b": "cancelled", "c": "cancelled"}
+# 状态查询展示取消原因与时间
+st = client.get(f"/api/releases/{cancel_id}").json()
+assert st["status"] == "cancelled"
+assert st["cancel_reason"] == "需求变更，停止发布" and st["cancelled_at"]
+# 列表摘要同样展示取消信息
+item = next(i for i in client.get("/api/releases?limit=200").json()["items"]
+            if i["id"] == cancel_id)
+assert item["status"] == "cancelled" and item["cancel_reason"] == "需求变更，停止发布"
+assert item["cancelled_at"] and item["revision"] == 1
+print("[OK] pending 批次取消 -> 全部节点 cancelled，状态/列表展示取消原因、时间与新修订号")
+
+# 23b. 取消后批次冻结：report / retry / 再次取消均被拒绝
+r = client.post(f"/api/releases/{cancel_id}/report",
+                json={"node": "a", "status": "success", "version": "v-cancel"})
+assert r.status_code == 409 and r.json()["error"]["code"] == "release_cancelled"
+assert r.json()["error"]["cancel_reason"] == "需求变更，停止发布"
+r = client.post(f"/api/releases/{cancel_id}/retry")
+assert r.status_code == 409 and r.json()["error"]["code"] == "release_cancelled"
+r = client.post(f"/api/releases/{cancel_id}/cancel",
+                json={"reason": "再次取消", "expected_revision": 1})
+assert r.status_code == 409 and r.json()["error"]["code"] == "cancel_not_allowed"
+print("[OK] 已取消批次拒绝 report / retry（409 release_cancelled）与再次取消")
+
+# 23c. running 批次：未执行节点 cancelled + 已成功节点逆拓扑回滚
+r = client.post("/api/releases", json={
+    "version": "v-cancel2",
+    "nodes": [{"name": "a"}, {"name": "b"}, {"name": "c"}, {"name": "d"}],
+    "dependencies": [
+        {"from_node": "a", "to_node": "c"},
+        {"from_node": "b", "to_node": "c"},
+        {"from_node": "c", "to_node": "d"},
+    ],
+})
+cancel2 = r.json()["id"]
+assert client.post(f"/api/releases/{cancel2}/report",
+                   json={"node": "a", "status": "success",
+                         "version": "v-cancel2"}).status_code == 200
+assert client.post(f"/api/releases/{cancel2}/report",
+                   json={"node": "b", "status": "success",
+                         "version": "v-cancel2"}).status_code == 200
+st = client.get(f"/api/releases/{cancel2}").json()
+assert st["status"] == "running" and st["revision"] == 2  # 每次状态迁移修订号 +1
+
+# 用旧修订号取消 -> 409 state_conflict（状态不变）
+r = client.post(f"/api/releases/{cancel2}/cancel",
+                json={"reason": "旧修订号", "expected_revision": 0})
+assert r.status_code == 409 and r.json()["error"]["code"] == "state_conflict"
+assert r.json()["error"]["current_revision"] == 2
+st = client.get(f"/api/releases/{cancel2}").json()
+assert st["status"] == "running" and st["revision"] == 2
+
+r = client.post(f"/api/releases/{cancel2}/cancel",
+                json={"reason": "线上告警，紧急取消", "expected_revision": 2})
+assert r.status_code == 200, r.text
+cb2 = r.json()
+assert cb2["revision"] == 3
+assert [n["node"] for n in cb2["cancelled_nodes"]] == ["c", "d"]  # 未执行节点
+# 已成功节点逆拓扑回滚：同层按成功时间倒序（b 后成功先回滚）
+assert [n["node"] for n in cb2["rolled_back_nodes"]] == ["b", "a"]
+ns2 = {n["name"]: n["status"] for n in cb2["release"]["nodes"]}
+assert ns2 == {"a": "rolled_back", "b": "rolled_back",
+               "c": "cancelled", "d": "cancelled"}, ns2
+print("[OK] running 批次取消 -> c/d cancelled，a/b 逆拓扑回滚 [b,a]，revision 2->3")
+
+# 23d. 终态批次不可取消；缺失批次 404；请求校验 422
+r = client.post(f"/api/releases/{rid}/cancel",  # rid：第 10 步已 succeeded
+                json={"reason": "已完成", "expected_revision": 999})
+assert r.status_code == 409 and r.json()["error"]["code"] == "cancel_not_allowed"
+assert r.json()["error"]["status"] == "succeeded"
+r = client.post(f"/api/releases/{rid2}/cancel",  # rid2：第 11 步 failed
+                json={"reason": "已失败", "expected_revision": 0})
+assert r.status_code == 409 and r.json()["error"]["code"] == "cancel_not_allowed"
+# partially_rolled_back 终态同样不可取消
+r = client.post("/api/releases", json={
+    "version": "v-cancel-prb",
+    "nodes": [{"name": "x"}, {"name": "y"}],
+    "dependencies": [{"from_node": "x", "to_node": "y"}],
+})
+prb_id = r.json()["id"]
+client.post(f"/api/releases/{prb_id}/report",
+            json={"node": "x", "status": "success", "version": "v-cancel-prb"})
+client.post(f"/api/releases/{prb_id}/report",
+            json={"node": "y", "status": "failed", "version": "v-cancel-prb"})
+assert client.get(f"/api/releases/{prb_id}").json()["status"] == "partially_rolled_back"
+r = client.post(f"/api/releases/{prb_id}/cancel",
+                json={"reason": "已回滚", "expected_revision": 2})
+assert r.status_code == 409 and r.json()["error"]["code"] == "cancel_not_allowed"
+assert r.json()["error"]["status"] == "partially_rolled_back"
+# 不存在的批次 -> 404
+r = client.post("/api/releases/ghost/cancel",
+                json={"reason": "不存在", "expected_revision": 0})
+assert r.status_code == 404 and r.json()["error"]["code"] == "release_not_found"
+# 请求校验：缺 reason / 缺 expected_revision / 负修订号 -> 422
+assert client.post(f"/api/releases/{cancel2}/cancel",
+                   json={"expected_revision": 3}).status_code == 422
+assert client.post(f"/api/releases/{cancel2}/cancel",
+                   json={"reason": "缺修订号"}).status_code == 422
+assert client.post(f"/api/releases/{cancel2}/cancel",
+                   json={"reason": "负修订号", "expected_revision": -1}).status_code == 422
+print("[OK] 终态批次取消 -> 409 cancel_not_allowed；缺失批次 404；请求校验 422")
+
+# 23e. 自动重试等待中的节点随批次取消：状态 cancelled、重试标记清除
+r = client.post("/api/releases", json={
+    "version": "v-cancel-retry",
+    "nodes": [{"name": "w", "max_attempts": 3, "retry_delay_seconds": 3600}],
+})
+cr_id = r.json()["id"]
+client.post(f"/api/releases/{cr_id}/report",
+            json={"node": "w", "status": "failed", "version": "v-cancel-retry"})
+st = client.get(f"/api/releases/{cr_id}").json()
+assert st["status"] == "running" and st["next_nodes"] == []  # 重试等待中
+r = client.post(f"/api/releases/{cr_id}/cancel",
+                json={"reason": "不再重试", "expected_revision": st["revision"]})
+assert r.status_code == 200, r.text
+node_w = r.json()["release"]["nodes"][0]
+assert node_w["status"] == "cancelled"
+assert node_w["retry_scheduled"] is False and node_w["next_retry_at"] is None
+print("[OK] 重试等待中的节点随批次取消并清除重试标记")
+
+# 23f. 并发：取消与节点回报只有一个状态迁移成功（事务串行化 + 修订号比较-交换）
+import threading  # noqa: E402
+
+r = client.post("/api/releases", json={
+    "version": "v-race", "nodes": [{"name": "only"}],
+})
+race_id = r.json()["id"]
+race: dict = {}
+barrier = threading.Barrier(3)
+
+
+def _race_report():
+    c = TestClient(app)
+    barrier.wait()
+    race["report"] = c.post(
+        f"/api/releases/{race_id}/report",
+        json={"node": "only", "status": "success", "version": "v-race"})
+
+
+def _race_cancel():
+    c = TestClient(app)
+    barrier.wait()
+    race["cancel"] = c.post(
+        f"/api/releases/{race_id}/cancel",
+        json={"reason": "并发取消", "expected_revision": 0})
+
+
+t_report = threading.Thread(target=_race_report)
+t_cancel = threading.Thread(target=_race_cancel)
+t_report.start()
+t_cancel.start()
+barrier.wait()  # 主线程放行，两个请求尽量同时发出
+t_report.join()
+t_cancel.join()
+
+outcomes = sorted([race["report"].status_code, race["cancel"].status_code])
+assert outcomes == [200, 409], outcomes  # 恰好一个状态迁移成功
+final = client.get(f"/api/releases/{race_id}").json()
+if race["cancel"].status_code == 200:
+    # 取消先提交：回报看到已取消批次被拒
+    assert race["report"].json()["error"]["code"] == "release_cancelled"
+    assert final["status"] == "cancelled" and final["revision"] == 1
+    assert final["nodes"][0]["status"] == "cancelled"
+else:
+    # 回报先提交：批次 succeeded 且修订号 0->1，取消被拒
+    assert race["report"].status_code == 200
+    assert race["cancel"].json()["error"]["code"] in ("state_conflict", "cancel_not_allowed")
+    assert final["status"] == "succeeded" and final["revision"] == 1
+    assert final["nodes"][0]["status"] == "success"
+print("[OK] 取消与回报并发：恰好一个状态迁移成功 ->",
+      {"report": race["report"].status_code, "cancel": race["cancel"].status_code},
+      "终态:", final["status"])
+
+# 23g. 旧批次兼容：迁移后取消字段为 NULL；修订号随状态迁移递增；终态不可取消
+config.DB_PATH = old_db
+database.init_db(old_db)
+with TestClient(app) as legacy_client:
+    lg = legacy_client.get("/api/releases/leg1").json()
+    # 迁移时 revision 从 0 开始，第 21 步的失败回报已使其 +1
+    assert lg["revision"] == 1
+    assert lg["cancel_reason"] is None and lg["cancelled_at"] is None
+    # leg1 在第 21 步进入 failed 终态：不可取消
+    r = legacy_client.post("/api/releases/leg1/cancel",
+                           json={"reason": "旧批次", "expected_revision": 1})
+    assert r.status_code == 409 and r.json()["error"]["code"] == "cancel_not_allowed"
+config.DB_PATH = os.environ["DB_PATH"]
+database.init_db(os.environ["DB_PATH"])
+print("[OK] 旧批次迁移后取消字段为空、修订号随状态迁移递增，终态不可取消")
 
 print("\n全部测试通过 ✔")
