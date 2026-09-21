@@ -22,7 +22,8 @@ PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS releases (
     id              TEXT PRIMARY KEY,
     version         TEXT NOT NULL,
-    status          TEXT NOT NULL,              -- running | succeeded | failed | partially_rolled_back
+    status          TEXT NOT NULL,              -- pending | running | succeeded | failed | partially_rolled_back | cancelled
+    revision        INTEGER NOT NULL DEFAULT 1, -- 乐观锁修订号：每次批次级状态迁移 +1，取消需携带 expected_revision
     levels_json     TEXT NOT NULL DEFAULT '[]', -- 拓扑层级（按 targets 裁剪后的诱导子图）: [["a"],["b","c"],["d"]]
     targets_json    TEXT,                       -- 显式目标节点名（JSON 数组）；NULL=未按目标裁剪的全量批次
     excluded_node_count INTEGER NOT NULL DEFAULT 0, -- 因 targets 裁剪而排除的节点数；全量批次为 0
@@ -30,6 +31,8 @@ CREATE TABLE IF NOT EXISTS releases (
     error_message   TEXT,
     failed_node     TEXT,
     failed_at       TEXT,
+    cancel_reason   TEXT,                       -- 安全取消原因（仅 cancelled 批次非 NULL）
+    cancelled_at    TEXT,                       -- 取消时间（UTC ISO-8601；仅 cancelled 批次非 NULL）
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -48,7 +51,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     is_target    INTEGER NOT NULL DEFAULT 0,      -- 1=创建批次时显式指定的目标节点，旧批次兼容为 0
     level        INTEGER NOT NULL,
     metadata_json TEXT NOT NULL DEFAULT '{}',
-    status       TEXT NOT NULL DEFAULT 'pending', -- pending | success | failed | rolled_back
+    status       TEXT NOT NULL DEFAULT 'pending', -- pending | success | failed | rolled_back | cancelled
     reported_version TEXT,
     error_code   TEXT,
     error_message TEXT,
@@ -72,7 +75,7 @@ CREATE TABLE IF NOT EXISTS node_events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     release_id   TEXT NOT NULL,
     node_name    TEXT NOT NULL,
-    event_type   TEXT NOT NULL, -- report_success | report_failure | rollback | retry_reset | retry_scheduled
+    event_type   TEXT NOT NULL, -- report_success | report_failure | rollback | retry_reset | retry_scheduled | cancelled | cancel_rollback
     version      TEXT,
     detail_json  TEXT NOT NULL DEFAULT '{}',
     created_at   TEXT NOT NULL
@@ -123,6 +126,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE releases ADD COLUMN excluded_node_count INTEGER NOT NULL DEFAULT 0"
         )
+    if "revision" not in release_cols:
+        # 旧批次从未发生过状态迁移，修订号从 1 起
+        conn.execute(
+            "ALTER TABLE releases ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"
+        )
+    if "cancel_reason" not in release_cols:
+        conn.execute("ALTER TABLE releases ADD COLUMN cancel_reason TEXT")
+    if "cancelled_at" not in release_cols:
+        conn.execute("ALTER TABLE releases ADD COLUMN cancelled_at TEXT")
 
 
 def init_db(db_path: str | None = None) -> None:

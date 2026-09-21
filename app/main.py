@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from . import config, service
 from .database import init_db
 from .errors import APIError
-from .models import CreateReleaseRequest, ReportRequest
+from .models import CancelReleaseRequest, CreateReleaseRequest, ReportRequest
 
 
 @asynccontextmanager
@@ -22,7 +22,8 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="依赖图发布回滚 API",
     description="客户端提交服务节点及依赖关系，按拓扑层级生成执行计划，"
-                "支持节点成功/失败回报、失败仅回滚本批次已成功节点、从断点重试。",
+                "支持节点成功/失败回报、失败仅回滚本批次已成功节点、从断点重试、"
+                "乐观锁安全取消（pending/running 批次可取消，逆拓扑回滚已成功节点）。",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -120,6 +121,23 @@ def report_node(release_id: str, payload: ReportRequest) -> dict:
 def retry_release(release_id: str) -> dict:
     """从断点续发：重置 failed/rolled_back 节点，从最低待执行层级继续。"""
     return service.retry_release(release_id)
+
+
+@app.post("/api/releases/{release_id}/cancel", tags=["releases"])
+def cancel_release(release_id: str, payload: CancelReleaseRequest) -> dict:
+    """安全取消发布批次（乐观锁）。
+
+    - 仅 ``pending`` / ``running`` 批次可取消；携带 ``expected_revision``，与当前
+      修订号在同一 SQLite 事务内比较，过期返回 **409 state_conflict** 且状态不变。
+    - 取消成功后：未执行节点（pending，含自动重试等待中的节点）标记为 ``cancelled``，
+      已成功节点按**逆拓扑顺序**回滚为 ``rolled_back``，批次进入终态 ``cancelled``，
+      ``revision`` +1，返回 ``cancelled_nodes`` / ``rolled_back_nodes`` / 新 ``revision``。
+    - 与节点回报并发时，条件状态迁移保证只有一方成功（落败方 409）。
+    - 取消后的批次拒绝 report 与 retry，统一返回 **409 release_cancelled**。
+    - 批次不存在返回 404 release_not_found；已是终态（succeeded / failed /
+      partially_rolled_back）返回 409 cancel_not_allowed。
+    """
+    return service.cancel_release(release_id, payload)
 
 
 if __name__ == "__main__":

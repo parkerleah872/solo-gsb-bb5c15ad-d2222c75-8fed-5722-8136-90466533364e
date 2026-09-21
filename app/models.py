@@ -44,3 +44,11 @@ class ReportRequest(BaseModel):
     version: str = Field(..., min_length=1, description="回报时携带的版本号，必须与批次版本一致")
     error_code: str | None = Field(None, description="失败错误码（失败时可选）")
     error_message: str | None = Field(None, description="失败原因（失败时可选）")
+
+
+class CancelReleaseRequest(BaseModel):
+    reason: str = Field(..., min_length=1, description="取消原因，会持久化并在状态查询中返回")
+    expected_revision: int = Field(
+        ..., ge=1,
+        description="乐观锁：调用方最后一次看到的批次修订号；与当前 revision 不一致时返回 409 state_conflict 且状态不变",
+    )
